@@ -1,4 +1,5 @@
 # DuckStation - PlayStation 1, aka. PSX Emulator
+This fork allows you to play HD MP4 movie replacements instead of low quality STRs on the CD image.
 
 [Features](#features) | [Downloading and Running](#downloading-and-running) | [Building](#building) | [Disclaimers](#disclaimers)
 
