@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
 // SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "cdrom.h"
@@ -13,6 +13,7 @@
 #include "spu.h"
 #include "system.h"
 #include "timing_event.h"
+#include "video_replacement.h"
 
 #include "util/cd_image.h"
 #include "util/imgui_manager.h"
@@ -21,15 +22,14 @@
 #include "util/translation.h"
 
 #include "common/align.h"
-#include "common/bcdutils.h"
 #include "common/bitfield.h"
-#include "common/bitutils.h"
 #include "common/error.h"
 #include "common/fifo_queue.h"
 #include "common/file_system.h"
 #include "common/gsvector.h"
 #include "common/heap_array.h"
 #include "common/log.h"
+#include "common/string_util.h"
 #include "common/xorshift_prng.h"
 
 #include "IconsEmoji.h"
@@ -38,6 +38,7 @@
 
 #include <cmath>
 #include <map>
+#include <set>
 #include <vector>
 
 LOG_CHANNEL(CDROM);
@@ -963,8 +964,8 @@ bool CDROM::InsertMedia(std::unique_ptr<CDImage>& media, DiscRegion region, std:
   if (s_state.drive_state != DriveState::ShellOpening)
     StartMotor();
 
-  if (s_state.show_current_file)
-    CreateFileMap();
+  // Always create file map for video replacement and debug display
+  CreateFileMap();
 
   return true;
 }
@@ -982,8 +983,9 @@ std::unique_ptr<CDImage> CDROM::RemoveMedia(bool for_disc_swap)
   INFO_LOG("Removing CD...");
   std::unique_ptr<CDImage> image = s_reader.RemoveMedia();
 
-  if (s_state.show_current_file)
-    CreateFileMap();
+  // Clear file map when media is removed
+  s_state.file_map.clear();
+  s_state.file_map_created = false;
 
   s_state.last_sector_header_valid = false;
 
@@ -3262,6 +3264,9 @@ void CDROM::StopReadingWithDataEnd()
 
   s_state.secondary_status.ClearActiveBits();
   ClearDriveState();
+  
+  // Notify video replacement system that STR playback stopped
+  VideoReplacement::OnSTRFileClosed();
 }
 
 void CDROM::StopReadingWithError(u8 reason)
@@ -3271,6 +3276,9 @@ void CDROM::StopReadingWithError(u8 reason)
 
   s_state.secondary_status.ClearActiveBits();
   ClearDriveState();
+  
+  // Notify video replacement system that STR playback stopped
+  VideoReplacement::OnSTRFileClosed();
 }
 
 void CDROM::StartMotor()
@@ -3293,6 +3301,9 @@ void CDROM::StopMotor()
   ClearDriveState();
   SetHoldPosition(0, 0);
   s_state.last_sector_header_valid = false; // TODO: correct?
+  
+  // Notify video replacement system that STR playback stopped
+  VideoReplacement::OnSTRFileClosed();
 }
 
 void CDROM::DoSectorRead()
@@ -3313,6 +3324,59 @@ void CDROM::DoSectorRead()
   s_state.last_subq_needs_update = false;
   s_state.subq_lba_update_tick = System::GetGlobalTickCounter();
   s_state.subq_lba_update_carry = 0;
+
+  // Notify video replacement system of every sector read for tracking
+  VideoReplacement::OnSectorRead(s_state.current_lba);
+
+  // Check for video replacement BEFORE processing sector type
+  // This catches ALL sectors including XA-ADPCM (STR files)
+  if (!VideoReplacement::IsPlayingReplacement())
+  {
+    if (s_state.file_map_created && !s_state.file_map.empty())
+    {
+      u32 start_lba, end_lba;
+      const std::string* file_path = LookupFileMap(s_state.current_lba, &start_lba, &end_lba);
+      
+      if (file_path)
+      {
+        // Check if this is an STR file
+        if (StringUtil::EndsWithNoCase(*file_path, ".STR"))
+        {
+          const u32 file_size_sectors = (end_lba - start_lba) + 1;
+          INFO_LOG("STR file access detected at LBA {}: {} (sectors {}-{}, {} sectors total)", 
+                   s_state.current_lba, *file_path, start_lba, end_lba, file_size_sectors);
+          
+          // Try to get replacement video
+          std::string replacement_path = VideoReplacement::GetReplacementPath(*file_path);
+          if (!replacement_path.empty())
+          {
+            // Trigger the video replacement overlay with LBA range and current position for sync
+            if (VideoReplacement::OnSTRFileOpened(*file_path, file_size_sectors, start_lba, end_lba, s_state.current_lba))
+            {
+              INFO_LOG("Video replacement activated for: {}", *file_path);
+            }
+            else
+            {
+              WARNING_LOG("Video replacement found but failed to start for: {}", *file_path);
+            }
+          }
+        }
+      }
+    }
+    else
+    {
+      // Log why we're not checking
+      static bool logged_no_filemap = false;
+      if (!logged_no_filemap)
+      {
+        if (!s_state.file_map_created)
+          WARNING_LOG("File map not created yet, video replacement unavailable");
+        else if (s_state.file_map.empty())
+          WARNING_LOG("File map is empty, video replacement unavailable");
+        logged_no_filemap = true;
+      }
+    }
+  }
 
   s_state.secondary_status.SetReadingBits(s_state.drive_state == DriveState::Playing);
 
@@ -3449,6 +3513,10 @@ ALWAYS_INLINE_RELEASE void CDROM::ProcessDataSector(const u8* raw_sector, const 
 
   // TODO: How does XA relate to this buffering?
   SectorBuffer* sb = &s_state.sector_buffers[sb_num];
+  
+  
+  
+  
   if (sb->position == 0 && sb->size > 0)
   {
     DEV_LOG("Sector buffer {} was not read, previous sector dropped",
@@ -4022,21 +4090,39 @@ void CDROM::CreateFileMap()
   s_state.file_map_created = true;
 
   if (!s_reader.HasMedia())
+  {
+    INFO_LOG("No media present, file map not created");
     return;
+  }
 
   s_reader.WaitForIdle();
   CDImage* media = s_reader.GetMedia();
   IsoReader iso;
   if (!iso.Open(media, 1))
   {
-    ERROR_LOG("Failed to open ISO filesystem.");
+    ERROR_LOG("Failed to open ISO filesystem for file map creation");
     return;
   }
 
-  DEV_LOG("Creating file map for {}...", media->GetPath());
+  INFO_LOG("Creating file map for disc: {}", media->GetPath());
   s_state.file_map.emplace(iso.GetPVDLBA(), std::make_pair(iso.GetPVDLBA(), std::string("PVD")));
   CreateFileMap(iso, std::string_view());
-  DEV_LOG("Found {} files", s_state.file_map.size());
+  INFO_LOG("File map created with {} files", s_state.file_map.size());
+  
+  // Log all STR files found (for debugging video replacement)
+  u32 str_count = 0;
+  for (const auto& [lba, file_info] : s_state.file_map)
+  {
+    if (StringUtil::EndsWithNoCase(file_info.second, ".STR"))
+    {
+      INFO_LOG("  Found STR file: {} (LBA {}-{})", file_info.second, lba, file_info.first);
+      str_count++;
+    }
+  }
+  if (str_count > 0)
+    INFO_LOG("Total {} STR files found in file map", str_count);
+  else
+    INFO_LOG("No STR files found in file map");
 }
 
 void CDROM::CreateFileMap(IsoReader& iso, std::string_view dir)
